@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#1a1410" />
+  <title>Clack — diner feel-test</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #1a1410; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+    #hud {
+      position: fixed; inset: 0; pointer-events: none;
+      display: flex; flex-direction: column; justify-content: space-between;
+      padding: calc(10px + env(safe-area-inset-top)) 12px calc(12px + env(safe-area-inset-bottom));
+    }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .row.bottom { pointer-events: auto; justify-content: center; }
+    .chip, button.act {
+      pointer-events: auto;
+      border: 0; border-radius: 999px;
+      background: rgba(20,14,10,.72);
+      color: #f4e8d4;
+      backdrop-filter: blur(10px);
+      font-size: 13px; font-weight: 600;
+      padding: 10px 14px;
+    }
+    button.act { min-height: 44px; min-width: 72px; cursor: pointer; }
+    button.act.primary { background: #c45c2a; color: #fff8f0; }
+    button.act:disabled { opacity: .35; }
+    #hint { color: #f4e8d4; text-shadow: 0 1px 8px #000; font-size: 14px; font-weight: 600; }
+    #count { margin-left: auto; }
+    #scrubWrap {
+      pointer-events: auto; width: 100%;
+      display: none; align-items: center; gap: 10px;
+      background: rgba(20,14,10,.72); border-radius: 999px; padding: 8px 14px;
+      backdrop-filter: blur(10px); color: #f4e8d4; font-size: 12px;
+    }
+    #scrubWrap.show { display: flex; }
+    input[type=range] { flex: 1; accent-color: #e8b06a; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <div class="row">
+      <span id="hint">Draw a line on the diner floor</span>
+      <span class="chip" id="count">0 / 100</span>
+    </div>
+    <div id="scrubWrap">
+      <span>scrub</span>
+      <input id="scrub" type="range" min="0" max="1000" value="1000" />
+    </div>
+    <div class="row bottom">
+      <button class="act" id="btnClear">Clear</button>
+      <button class="act" id="btnReset">Stand</button>
+      <button class="act primary" id="btnTip">Tip</button>
+      <button class="act" id="btnReplay">Replay</button>
+    </div>
+  </div>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.170.0/build/three.module.js"
+    }
+  }
+  </script>
+  <script type="module">
+import * as THREE from "three";
+
+const MAX = 100;
+const SPACING = 0.22;
+const TILE_W = 0.16;
+const TILE_H = 0.34;
+const TILE_D = 0.048;
+const FALL_DUR = 0.22;
+const WAVE_GAP = 0.11;
+const FLOOR_Y = 0;
+
+const state = {
+  mode: "draw",
+  raw: [],
+  tiles: [],
+  drawing: false,
+  t: 0,
+  duration: 0,
+  replayPlaying: false,
+};
+
+const hint = document.getElementById("hint");
+const countEl = document.getElementById("count");
+const btnTip = document.getElementById("btnTip");
+const btnReset = document.getElementById("btnReset");
+const btnClear = document.getElementById("btnClear");
+const btnReplay = document.getElementById("btnReplay");
+const scrubWrap = document.getElementById("scrubWrap");
+const scrub = document.getElementById("scrub");
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color("#2a2118");
+scene.fog = new THREE.Fog("#2a2118", 8, 18);
+
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.05, 40);
+const drawCam = { pos: new THREE.Vector3(0, 9.2, 6.4), look: new THREE.Vector3(0, 0, 0.4) };
+camera.position.copy(drawCam.pos);
+camera.lookAt(drawCam.look);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+document.body.prepend(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xffe6c4, 0x3a2a1a, 0.7));
+const key = new THREE.DirectionalLight(0xffd7a8, 1.35);
+key.position.set(3.5, 8, 4);
+key.castShadow = true;
+key.shadow.mapSize.set(1024, 1024);
+key.shadow.camera.near = 1;
+key.shadow.camera.far = 20;
+key.shadow.camera.left = -8;
+key.shadow.camera.right = 8;
+key.shadow.camera.top = 8;
+key.shadow.camera.bottom = -8;
+scene.add(key);
+const lamp = new THREE.PointLight(0xffb060, 12, 14, 2);
+lamp.position.set(-1.2, 2.4, -1.6);
+scene.add(lamp);
+
+function box(w, h, d, color, x, y, z, opts = {}) {
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshStandardMaterial({ color, roughness: opts.rough ?? 0.7, metalness: 0.02 })
+  );
+  mesh.position.set(x, y, z);
+  mesh.castShadow = !opts.noShadow;
+  mesh.receiveShadow = true;
+  scene.add(mesh);
+  return mesh;
+}
+
+const floor = new THREE.Mesh(
+  new THREE.PlaneGeometry(14, 12),
+  new THREE.MeshStandardMaterial({ color: "#6b4a32", roughness: 0.85 })
+);
+floor.rotation.x = -Math.PI / 2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+const floorMat2 = new THREE.MeshStandardMaterial({ color: "#5a3d29", roughness: 0.85 });
+for (let x = -6; x < 6; x++) {
+  for (let z = -5; z < 5; z++) {
+    if ((x + z) % 2 !== 0) continue;
+    const plank = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), floorMat2);
+    plank.rotation.x = -Math.PI / 2;
+    plank.position.set(x + 0.5, 0.002, z + 0.5);
+    plank.receiveShadow = true;
+    scene.add(plank);
+  }
+}
+
+box(14.2, 2.4, 0.2, "#3d2a20", 0, 1.2, -6);
+box(0.2, 2.4, 12.2, "#3d2a20", -7, 1.2, 0);
+box(0.2, 2.4, 12.2, "#35241c", 7, 1.2, 0);
+box(14.2, 0.16, 0.16, "#c9a36a", 0, 2.42, -5.92);
+
+box(2.6, 0.72, 1.1, "#5c2a22", -3.6, 0.36, -3.9);
+box(2.6, 1.15, 0.22, "#4a221c", -3.6, 1.05, -4.42);
+box(2.2, 0.08, 0.9, "#2a1c14", -3.6, 0.76, -3.35);
+box(0.18, 0.7, 0.18, "#2a1c14", -4.4, 0.39, -3.65);
+box(0.18, 0.7, 0.18, "#2a1c14", -2.8, 0.39, -3.65);
+box(0.18, 0.7, 0.18, "#2a1c14", -4.4, 0.39, -3.05);
+box(0.18, 0.7, 0.18, "#2a1c14", -2.8, 0.39, -3.05);
+
+box(4.4, 0.92, 0.85, "#3a2a22", 3.4, 0.46, -3.7);
+box(4.5, 0.06, 0.95, "#d8c4a0", 3.4, 0.95, -3.7);
+box(0.35, 0.22, 0.35, "#c45c2a", 2.2, 1.12, -3.55);
+box(0.22, 0.28, 0.22, "#eee8dc", 4.2, 1.16, -3.55);
+box(0.22, 0.16, 0.22, "#eee8dc", 4.45, 1.1, -3.7);
+
+const blocked = [
+  { minX: -5.1, maxX: -2.1, minZ: -4.7, maxZ: -2.7 },
+  { minX: 1.1, maxX: 5.7, minZ: -4.3, maxZ: -3.15 },
+];
+
+function onBlocked(x, z) {
+  return blocked.some((b) => x > b.minX && x < b.maxX && z > b.minZ && z < b.maxZ);
+}
+
+const tileGeo = new THREE.BoxGeometry(TILE_W, TILE_H, TILE_D);
+const tileMatA = new THREE.MeshStandardMaterial({ color: "#f3ead8", roughness: 0.45 });
+const tileMatB = new THREE.MeshStandardMaterial({ color: "#e7d3b0", roughness: 0.45 });
+const tileMatFirst = new THREE.MeshStandardMaterial({ color: "#e8a05a", roughness: 0.4 });
+
+const ghost = new THREE.Mesh(tileGeo, new THREE.MeshStandardMaterial({
+  color: "#f3ead8", transparent: true, opacity: 0.35, roughness: 0.5
+}));
+ghost.visible = false;
+scene.add(ghost);
+
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const hit = new THREE.Vector3();
+
+function setHint(t) { hint.textContent = t; }
+function refreshHud() {
+  countEl.textContent = `${state.tiles.length} / ${MAX}`;
+  const n = state.tiles.length;
+  btnTip.disabled = n < 2 || state.mode === "falling";
+  btnReplay.disabled = n < 2;
+  btnReset.disabled = n < 1;
+  btnClear.disabled = n < 1 && state.raw.length < 1;
+  scrubWrap.classList.toggle("show", state.mode === "done" || state.mode === "replay");
+}
+
+function ndcFromEvent(e) {
+  const t = e.touches ? e.touches[0] : e;
+  pointer.x = (t.clientX / innerWidth) * 2 - 1;
+  pointer.y = -(t.clientY / innerHeight) * 2 + 1;
+}
+
+function floorPoint(e) {
+  ndcFromEvent(e);
+  raycaster.setFromCamera(pointer, camera);
+  if (raycaster.ray.intersectPlane(floorPlane, hit)) return hit.clone();
+  return null;
+}
+
+function resample(points) {
+  if (points.length < 2) return points.slice();
+  const out = [points[0].clone()];
+  let acc = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = out[out.length - 1];
+    const b = points[i];
+    let d = a.distanceTo(b);
+    if (d < 1e-5) continue;
+    const dir = b.clone().sub(a);
+    while (acc + d >= SPACING) {
+      const need = SPACING - acc;
+      const p = a.clone().add(dir.clone().setLength(need));
+      if (out.length >= MAX) return out;
+      if (!onBlocked(p.x, p.z) && Math.abs(p.x) < 6.6 && Math.abs(p.z) < 5.6) out.push(p);
+      acc = 0;
+      d = p.distanceTo(b);
+      dir.copy(b).sub(p);
+      a.copy(p);
+    }
+    acc += d;
+  }
+  return out;
+}
+
+function clearTiles() {
+  for (const t of state.tiles) scene.remove(t.pivot);
+  state.tiles = [];
+}
+
+function buildTiles(points) {
+  clearTiles();
+  if (points.length < 2) return;
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const nxt = points[Math.min(i + 1, points.length - 1)];
+    const prv = points[Math.max(i - 1, 0)];
+    const dir = (i === points.length - 1 ? p.clone().sub(prv) : nxt.clone().sub(p));
+    dir.y = 0;
+    if (dir.lengthSq() < 1e-8) dir.set(0, 0, 1);
+    dir.normalize();
+    const yaw = Math.atan2(dir.x, dir.z);
+
+    const pivot = new THREE.Group();
+    pivot.position.set(p.x, FLOOR_Y, p.z);
+    pivot.rotation.y = yaw;
+
+    const mesh = new THREE.Mesh(tileGeo, i === 0 ? tileMatFirst : (i % 2 ? tileMatB : tileMatA));
+    mesh.position.set(0, TILE_H / 2, 0);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    pivot.add(mesh);
+    scene.add(pivot);
+
+    state.tiles.push({
+      pivot, mesh, pos: p.clone(), dir, yaw,
+      fallAxis: new THREE.Vector3(1, 0, 0),
+    });
+  }
+}
+
+function poseAt(time) {
+  const n = state.tiles.length;
+  for (let i = 0; i < n; i++) {
+    const start = i * WAVE_GAP;
+    const u = THREE.MathUtils.clamp((time - start) / FALL_DUR, 0, 1);
+    const eased = u * u * (3 - 2 * u);
+    const tile = state.tiles[i];
+    tile.pivot.rotation.set(0, tile.yaw, 0);
+    tile.pivot.rotateOnAxis(tile.fallAxis, eased * (Math.PI / 2) * 0.98);
+  }
+}
+
+function duration() {
+  const n = state.tiles.length;
+  return Math.max(0, (n - 1) * WAVE_GAP + FALL_DUR + 0.35);
+}
+
+function frontIndex(time) {
+  const i = Math.floor(time / WAVE_GAP);
+  return THREE.MathUtils.clamp(i, 0, Math.max(0, state.tiles.length - 1));
+}
+
+const camPos = new THREE.Vector3();
+const camLook = new THREE.Vector3();
+const camPosS = new THREE.Vector3().copy(drawCam.pos);
+const camLookS = new THREE.Vector3().copy(drawCam.look);
+
+function chaseTarget(time, outPos, outLook) {
+  const tiles = state.tiles;
+  if (tiles.length < 2) {
+    outPos.copy(drawCam.pos); outLook.copy(drawCam.look); return;
+  }
+  const i = frontIndex(time);
+  const a = tiles[i];
+  const b = tiles[Math.min(i + 1, tiles.length - 1)];
+  const localT = THREE.MathUtils.clamp((time - i * WAVE_GAP) / Math.max(WAVE_GAP, 0.001), 0, 1);
+  const p = a.pos.clone().lerp(b.pos, localT);
+  const dir = b.pos.clone().sub(a.pos); dir.y = 0;
+  if (dir.lengthSq() < 1e-6) dir.copy(a.dir);
+  dir.normalize();
+  outLook.set(p.x, 0.22, p.z).addScaledVector(dir, 0.55);
+  outPos.copy(p)
+    .addScaledVector(dir, -1.15)
+    .add(new THREE.Vector3(0, 0.72, 0));
+}
+
+function setMode(m) {
+  state.mode = m;
+  if (m === "draw") setHint(state.tiles.length ? "Draw more, or Tip the first tile" : "Draw a line on the diner floor");
+  if (m === "falling") setHint("Riding the wave");
+  if (m === "done") setHint("Scrub it. Replay. Stand them back up.");
+  if (m === "replay") setHint("Replay");
+  refreshHud();
+}
+
+function startFall(from = 0) {
+  if (state.tiles.length < 2) return;
+  state.t = from;
+  state.duration = duration();
+  state.replayPlaying = true;
+  setMode(from > 0.05 ? "replay" : "falling");
+}
+
+function finishFall() {
+  state.t = state.duration;
+  state.replayPlaying = false;
+  poseAt(state.t);
+  scrub.value = "1000";
+  setMode("done");
+}
+
+btnTip.addEventListener("click", () => startFall(0));
+btnReplay.addEventListener("click", () => startFall(0));
+btnReset.addEventListener("click", () => {
+  state.t = 0;
+  state.replayPlaying = false;
+  poseAt(0);
+  camPosS.copy(drawCam.pos);
+  camLookS.copy(drawCam.look);
+  setMode("draw");
+});
+btnClear.addEventListener("click", () => {
+  state.raw = [];
+  clearTiles();
+  ghost.visible = false;
+  state.t = 0;
+  state.replayPlaying = false;
+  camPosS.copy(drawCam.pos);
+  camLookS.copy(drawCam.look);
+  setMode("draw");
+  refreshHud();
+});
+scrub.addEventListener("input", () => {
+  if (!state.tiles.length) return;
+  state.duration = duration();
+  state.t = (scrub.value / 1000) * state.duration;
+  state.replayPlaying = false;
+  poseAt(state.t);
+  setMode("replay");
+});
+
+let drawLock = false;
+function onDown(e) {
+  if (e.target.closest("#hud")) return;
+  if (state.mode === "falling") return;
+  if (state.mode !== "draw") {
+    if (state.mode === "done" || state.mode === "replay") {
+      state.raw = [];
+      clearTiles();
+      camPosS.copy(drawCam.pos);
+      camLookS.copy(drawCam.look);
+      setMode("draw");
+    }
+  }
+  const p = floorPoint(e);
+  if (!p) return;
+  drawLock = true;
+  state.drawing = true;
+  if (state.raw.length === 0) state.raw = [p];
+  else state.raw.push(p);
+}
+
+function onMove(e) {
+  if (!state.drawing || !drawLock) return;
+  e.preventDefault();
+  const p = floorPoint(e);
+  if (!p) return;
+  const last = state.raw[state.raw.length - 1];
+  if (last && last.distanceTo(p) < 0.04) return;
+  if (onBlocked(p.x, p.z)) return;
+  if (Math.abs(p.x) > 6.6 || Math.abs(p.z) > 5.6) return;
+  state.raw.push(p.clone());
+  const pts = resample(state.raw);
+  buildTiles(pts);
+  if (pts.length) {
+    const lastT = pts[pts.length - 1];
+    ghost.visible = pts.length < MAX;
+    ghost.position.set(lastT.x, TILE_H / 2, lastT.z);
+  }
+  refreshHud();
+  setHint(state.tiles.length >= 2 ? "Lift to set the line" : "Keep drawing…");
+}
+
+function onUp() {
+  if (!state.drawing) return;
+  state.drawing = false;
+  drawLock = false;
+  ghost.visible = false;
+  const pts = resample(state.raw);
+  buildTiles(pts);
+  poseAt(0);
+  setMode("draw");
+  refreshHud();
+}
+
+renderer.domElement.addEventListener("pointerdown", onDown);
+renderer.domElement.addEventListener("pointermove", onMove, { passive: false });
+window.addEventListener("pointerup", onUp);
+window.addEventListener("pointercancel", onUp);
+renderer.domElement.addEventListener("touchmove", (e) => {
+  if (state.drawing) e.preventDefault();
+}, { passive: false });
+
+window.addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+let last = performance.now();
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+
+  if (state.replayPlaying) {
+    state.t += dt;
+    if (state.t >= state.duration) finishFall();
+    else {
+      poseAt(state.t);
+      scrub.value = String(Math.round((state.t / state.duration) * 1000));
+    }
+  }
+
+  if (state.mode === "falling" || state.mode === "replay" || state.mode === "done") {
+    chaseTarget(state.t, camPos, camLook);
+    const follow = state.mode === "done" ? 2.2 : 6.5;
+    camPosS.lerp(camPos, 1 - Math.exp(-follow * dt));
+    camLookS.lerp(camLook, 1 - Math.exp(-follow * dt));
+  } else {
+    camPosS.lerp(drawCam.pos, 1 - Math.exp(-3.2 * dt));
+    camLookS.lerp(drawCam.look, 1 - Math.exp(-3.2 * dt));
+  }
+  camera.position.copy(camPosS);
+  camera.lookAt(camLookS);
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+refreshHud();
+requestAnimationFrame(tick);
+  </script>
+</body>
+</html>
